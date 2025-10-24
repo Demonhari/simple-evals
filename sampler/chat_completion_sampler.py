@@ -3,8 +3,8 @@ from typing import Any
 
 import openai
 from openai import OpenAI
-
-from ..types import MessageList, SamplerBase, SamplerResponse
+import os
+from ..eval_types import MessageList, SamplerBase, SamplerResponse
 
 OPENAI_SYSTEM_MESSAGE_API = "You are a helpful assistant."
 OPENAI_SYSTEM_MESSAGE_CHATGPT = (
@@ -63,12 +63,24 @@ class ChatCompletionSampler(SamplerBase):
         trial = 0
         while True:
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=message_list,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                )
+                # build kwargs dynamically
+                kwargs = {
+                    "model": self.model,
+                    "messages": message_list,
+                }
+
+                # GPT-3.5, GPT-4-turbo, and GPT-4.1 allow custom temperature
+                if any(x in self.model for x in ["gpt-3.5", "gpt-4.1", "gpt-4-turbo"]):
+                    kwargs["temperature"] = self.temperature
+
+                # newer models (GPT-4o, GPT-5, etc.) use `max_completion_tokens`
+                if any(x in self.model for x in ["gpt-4o", "gpt-5"]):
+                    kwargs["max_completion_tokens"] = self.max_tokens
+                else:
+                    kwargs["max_tokens"] = self.max_tokens
+
+                response = self.client.chat.completions.create(**kwargs)
+
                 content = response.choices[0].message.content
                 if content is None:
                     raise ValueError("OpenAI API returned empty response; retrying")
@@ -77,7 +89,7 @@ class ChatCompletionSampler(SamplerBase):
                     response_metadata={"usage": response.usage},
                     actual_queried_message_list=message_list,
                 )
-            # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are reruning MMMU
+
             except openai.BadRequestError as e:
                 print("Bad Request Error", e)
                 return SamplerResponse(
@@ -85,12 +97,25 @@ class ChatCompletionSampler(SamplerBase):
                     response_metadata={"usage": None},
                     actual_queried_message_list=message_list,
                 )
+
             except Exception as e:
-                exception_backoff = 2**trial  # expontial back off
-                print(
-                    f"Rate limit exception so wait and retry {trial} after {exception_backoff} sec",
-                    e,
-                )
-                time.sleep(exception_backoff)
-                trial += 1
-            # unknown error shall throw exception
+                msg = str(e)
+                if "429" in msg or "rate_limit" in msg:
+                    wait_time = min(30, 5 * (2 ** trial))  # adaptive backoff, max 30s
+                    if int(os.getenv("HB_DEBUG", "0")):
+                        print(f"[Sampler pacing] ⚠️ 429 rate limit hit. Backing off {exception_backoff:.1f}s (trial {trial})")
+                    time.sleep(wait_time)
+                    trial += 1
+                    continue
+                elif "BadRequestError" in msg:
+                    print(f"[Sampler pacing] BadRequestError encountered — skipping sample.")
+                    return SamplerResponse(
+                        response_text="No response (bad request).",
+                        response_metadata={"usage": None},
+                        actual_queried_message_list=message_list,
+                    )
+                else:
+                    print(f"[Sampler pacing] Unexpected error: {msg}")
+                    raise
+
+

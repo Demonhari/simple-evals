@@ -1,10 +1,10 @@
 import time
 from typing import Any
-
+import os
 import openai
 from openai import OpenAI
 
-from ..types import MessageList, SamplerBase, SamplerResponse
+from ..eval_types import MessageList, SamplerBase, SamplerResponse
 
 
 class OChatCompletionSampler(SamplerBase):
@@ -70,11 +70,22 @@ class OChatCompletionSampler(SamplerBase):
                     actual_queried_message_list=message_list,
                 )
             except Exception as e:
-                exception_backoff = 2**trial  # expontial back off
-                print(
-                    f"Rate limit exception so wait and retry {trial} after {exception_backoff} sec",
-                    e,
-                )
-                time.sleep(exception_backoff)
-                trial += 1
-            # unknown error shall throw exception
+                msg = str(e)
+                if "429" in msg or "rate_limit" in msg:
+                    wait_time = min(30, 5 * (2 ** trial))  # adaptive backoff, max 30s
+                    if int(os.getenv("HB_DEBUG", "0")):
+                        print(f"[Sampler pacing] ⚠️ 429 rate limit hit. Backing off {exception_backoff:.1f}s (trial {trial})")
+                    time.sleep(wait_time)
+                    trial += 1
+                    continue
+                elif "BadRequestError" in msg:
+                    print(f"[Sampler pacing] BadRequestError encountered — skipping sample.")
+                    return SamplerResponse(
+                        response_text="No response (bad request).",
+                        response_metadata={"usage": None},
+                        actual_queried_message_list=message_list,
+                    )
+                else:
+                    print(f"[Sampler pacing] Unexpected error: {msg}")
+                    raise
+

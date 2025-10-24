@@ -5,7 +5,7 @@ from typing import Any
 import openai
 from openai import OpenAI
 
-from ..types import MessageList, SamplerBase, SamplerResponse
+from ..eval_types import MessageList, SamplerBase, SamplerResponse
 
 
 class ResponsesSampler(SamplerBase):
@@ -17,8 +17,8 @@ class ResponsesSampler(SamplerBase):
         self,
         model: str = "gpt-4.1",
         system_message: str | None = None,
-        temperature: float = 0.5,
         max_tokens: int = 1024,
+        temperature: float = 0.5,
         reasoning_model: bool = False,
         reasoning_effort: str | None = None,
     ):
@@ -27,7 +27,6 @@ class ResponsesSampler(SamplerBase):
         self.client = OpenAI()
         self.model = model
         self.system_message = system_message
-        self.temperature = temperature
         self.max_tokens = max_tokens
         self.image_format = "url"
         self.reasoning_model = reasoning_model
@@ -72,12 +71,20 @@ class ResponsesSampler(SamplerBase):
                         reasoning=reasoning,
                     )
                 else:
-                    response = self.client.responses.create(
-                        model=self.model,
-                        input=message_list,
-                        temperature=self.temperature,
-                        max_output_tokens=self.max_tokens,
-                    )
+                    # 🩹 Only send temperature for old models
+                    kwargs = {
+                        "model": self.model,
+                        "input": message_list,
+                        "max_output_tokens": self.max_tokens,
+                    }
+                    if any(
+                        x in self.model
+                        for x in ["gpt-3.5", "gpt-4-turbo", "gpt-4.1"]
+                    ):
+                        kwargs["temperature"] = self.temperature
+
+                    response = self.client.responses.create(**kwargs)
+
                 return SamplerResponse(
                     response_text=response.output_text,
                     response_metadata={"usage": response.usage},
@@ -91,11 +98,12 @@ class ResponsesSampler(SamplerBase):
                     actual_queried_message_list=message_list,
                 )
             except Exception as e:
-                exception_backoff = 2**trial  # expontial back off
+                exception_backoff = 2**trial
                 print(
                     f"Rate limit exception so wait and retry {trial} after {exception_backoff} sec",
                     e,
                 )
                 time.sleep(exception_backoff)
                 trial += 1
-            # unknown error shall throw exception
+
+                # unknown error shall throw exception

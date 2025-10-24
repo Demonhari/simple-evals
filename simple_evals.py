@@ -2,8 +2,9 @@ import argparse
 import json
 import subprocess
 from datetime import datetime
-
 import pandas as pd
+import os
+import time
 
 from . import common
 from .browsecomp_eval import BrowseCompEval
@@ -24,6 +25,10 @@ from .sampler.claude_sampler import ClaudeCompletionSampler, CLAUDE_SYSTEM_MESSA
 from .sampler.o_chat_completion_sampler import OChatCompletionSampler
 from .sampler.responses_sampler import ResponsesSampler
 from .simpleqa_eval import SimpleQAEval
+from .models import reflexxpp
+from .healthbench_eval import HealthBenchEval
+from .healthbench_meta_eval import HealthBenchMetaEval
+
 
 
 def main():
@@ -59,6 +64,13 @@ def main():
     parser.add_argument(
         "--examples", type=int, help="Number of examples to use (overrides default)"
     )
+    parser.add_argument(
+        "--sleep",
+        type=int,
+        default=0,
+        help="Number of seconds to sleep between evals (useful for avoiding rate limits)",
+    )
+
 
     args = parser.parse_args()
 
@@ -233,6 +245,8 @@ def main():
         "claude-3-haiku-20240307": ClaudeCompletionSampler(
             model="claude-3-haiku-20240307",
         ),
+        # Reflex X++ custom model
+        "reflexxpp": reflexxpp.ReflexXppSampler(),
     }
 
     if args.list_models:
@@ -252,7 +266,7 @@ def main():
     print(f"Running with args {args}")
 
     grading_sampler = ChatCompletionSampler(
-        model="gpt-4.1-2025-04-14",
+        model=os.environ.get("HB_GRADER_MODEL", "gpt-4.1"),
         system_message=OPENAI_SYSTEM_MESSAGE_API,
         max_tokens=2048,
     )
@@ -339,8 +353,10 @@ def main():
         for eval_name in evals_list:
             try:
                 evals[eval_name] = get_evals(eval_name, args.debug)
-            except Exception:
-                print(f"Error: eval '{eval_name}' not found.")
+            except Exception as e:
+                import traceback
+                print(f"❌ Exception while loading eval '{eval_name}': {e}")
+                traceback.print_exc()
                 return
     else:
         evals = {
@@ -361,6 +377,7 @@ def main():
             ]
         }
 
+
     print(evals)
     debug_suffix = "_DEBUG" if args.debug else ""
     print(debug_suffix)
@@ -373,8 +390,11 @@ def main():
     for model_name, sampler in models.items():
         for eval_name, eval_obj in evals.items():
             result = eval_obj(sampler)
-            # ^^^ how to use a sampler
             file_stem = f"{eval_name}_{model_name}"
+            if args.sleep > 0:
+                print(f"Sleeping {args.sleep}s before next eval to avoid rate limits...")
+                time.sleep(args.sleep)
+
             # file stem should also include the year, month, day, and time in hours and minutes
             file_stem += f"_{date_str}"
             report_filename = f"/tmp/{file_stem}{debug_suffix}.html"

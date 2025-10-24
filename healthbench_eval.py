@@ -284,6 +284,7 @@ class HealthBenchEval(Eval):
                 "physician_completions_mode must have reference completions if run_reference_completions is True"
             )
 
+        # Select the proper remote default file
         if subset_name == "hard":
             input_path = INPUT_PATH_HARD
         elif subset_name == "consensus":
@@ -291,21 +292,39 @@ class HealthBenchEval(Eval):
         elif subset_name is None:
             input_path = INPUT_PATH
         else:
-            assert False, f"Invalid subset name: {subset_name}"
+            raise ValueError(f"Invalid subset name: {subset_name}")
+
+        # 🔧 Allow local overrides if file exists (relative to this module)
+        local_path = (
+            Path(__file__).parent / f"evals/healthbench_{subset_name}.jsonl"
+            if subset_name
+            else Path(__file__).parent / "evals/healthbench.jsonl"
+        )
+
+        if local_path.exists():
+            print(f"Using local eval file: {local_path}")
+            input_path = str(local_path)
+        else:
+            print(f" Using default remote eval: {input_path}")
+
+        # 🔹 Load examples from the chosen file (local or remote)
         with bf.BlobFile(input_path, "rb") as f:
             examples = [json.loads(line) for line in f]
+
+        print(f" Loaded {len(examples)} examples from {input_path}")
+
+        # 🔹 Convert rubric dicts to RubricItem objects
         for example in examples:
             example["rubrics"] = [RubricItem.from_dict(d) for d in example["rubrics"]]
 
         rng = random.Random(0)
 
-        # physician completions mode
+        # Physician completions filtering
         self.physician_completions_mode = physician_completions_mode
         if self.physician_completions_mode is not None:
             assert self.physician_completions_mode in PHYSICIAN_COMPLETION_MODES, (
                 f"Invalid physician completions mode: {self.physician_completions_mode}; must be one of {PHYSICIAN_COMPLETION_MODES.keys()}"
             )
-            # subset to only the rows which have physician completions from that group
             examples_matching_mode = [
                 example
                 for example in examples
@@ -352,6 +371,7 @@ class HealthBenchEval(Eval):
         self.examples = examples * n_repeats
         self.n_threads = n_threads
         self.grader_model = grader_model
+
 
     def grade_sample(
         self,
@@ -446,27 +466,54 @@ class HealthBenchEval(Eval):
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         def fn(row: dict):
             prompt_messages = row["prompt"]
+            rubric_items = row["rubrics"]
+
+            # Defaults
+            response_text = ""
+            response_usage = None
+            actual_queried_prompt_messages = prompt_messages
 
             if self.physician_completions_mode is not None:
+                # Physician completion mode: use provided completion text
                 response_text = row["completion_to_trial"]
-                response_usage = None
-                actual_queried_prompt_messages = prompt_messages
             else:
-                sampler_response = sampler(prompt_messages)
-                response_text = sampler_response.response_text
-                response_dict = sampler_response.response_metadata
-                actual_queried_prompt_messages = (
-                    sampler_response.actual_queried_message_list
-                )
-                response_usage = response_dict.get("usage", None)
+                # Prefer rubric-aware generation if sampler supports it
+                used_rubric = False
+                if hasattr(sampler, "generate_with_rubric"):
+                    try:
+                        gen_out = sampler.generate_with_rubric(prompt_messages, rubric_items)
+                        used_rubric = True
+                        if isinstance(gen_out, str):
+                            response_text = gen_out
+                        else:
+                            # Accept objects that look like other samplers
+                            response_text = getattr(gen_out, "response_text", "") or ""
+                            actual_queried_prompt_messages = getattr(
+                                gen_out, "actual_queried_message_list", prompt_messages
+                            )
+                            resp_meta = getattr(gen_out, "response_metadata", {}) or {}
+                            response_usage = resp_meta.get("usage", None)
+                    except Exception:
+                        used_rubric = False  # fall back below
 
-            metrics, readable_explanation_str, rubric_items_with_grades = (
-                self.grade_sample(
-                    prompt=actual_queried_prompt_messages,
-                    response_text=response_text,
-                    rubric_items=row["rubrics"],
-                    example_tags=row["example_tags"],
-                )
+                if not used_rubric:
+                    # Fallback: plain sampler call (no rubric)
+                    sampler_response = sampler(prompt_messages)
+                    if isinstance(sampler_response, str):
+                        response_text = sampler_response
+                    else:
+                        response_text = getattr(sampler_response, "response_text", "") or ""
+                        actual_queried_prompt_messages = getattr(
+                            sampler_response, "actual_queried_message_list", prompt_messages
+                        )
+                        response_dict = getattr(sampler_response, "response_metadata", {}) or {}
+                        response_usage = response_dict.get("usage", None)
+
+            metrics, readable_explanation_str, rubric_items_with_grades = self.grade_sample(
+                prompt=actual_queried_prompt_messages,
+                response_text=response_text,
+                rubric_items=rubric_items,
+                example_tags=row["example_tags"],
             )
 
             score = metrics["overall_score"]
@@ -474,8 +521,7 @@ class HealthBenchEval(Eval):
             # Create HTML for each sample result
             html = common.jinja_env.from_string(
                 HEALTHBENCH_HTML_JINJA.replace(
-                    "{{ rubric_grades }}",
-                    readable_explanation_str.replace("\n", "<br>"),
+                    "{{ rubric_grades }}", readable_explanation_str.replace("\n", "<br>")
                 )
             ).render(
                 prompt_messages=actual_queried_prompt_messages,
